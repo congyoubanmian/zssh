@@ -75,6 +75,7 @@ fun ChatScreen(
     fun doSend(text: String) {
         val agent = AppSession.agentOrNull() ?: return
         val current = sid ?: return
+        if (connectionLost) return
         if (running) {
             // 引擎禁止并发发送（-32010），运行中的输入进队列，turn 结束自动提交
             sendQueue.add(text)
@@ -91,7 +92,7 @@ fun ChatScreen(
     fun drainQueue() {
         val agent = AppSession.agentOrNull() ?: return
         val current = sid ?: return
-        if (sendQueue.isEmpty() || running) return
+        if (sendQueue.isEmpty() || running || connectionLost) return
         val next = sendQueue.removeAt(0)
         bubbles.add(Bubble("user", next))
         running = true
@@ -175,13 +176,16 @@ fun ChatScreen(
                     running = false
                 }
                 "_zssh/disconnected" -> {
-                    // AgentSession 合成事件：引擎通道终止。必须复位全部运行状态，否则界面永久卡住
+                    // AgentSession 合成事件：引擎通道终止。必须复位全部运行状态，否则界面永久卡住；
+                    // 排队消息与待答权限请求一并清空（引擎已死，应答无意义且点击会触发未捕获异常）
                     val reason = payload.optString("reason")
                     bubbles.add(Bubble("assistant", "⚠️ 连接断开：$reason\n请点击下方「重新连接」恢复", kind = "tool"))
                     streaming = ""
                     reasoning = ""
                     reasoningLive = false
                     running = false
+                    sendQueue.clear()
+                    permissionQueue.clear()
                     connectionLost = true
                 }
             }
@@ -395,17 +399,21 @@ fun ChatScreen(
         Box(Modifier.padding(pad).fillMaxSize()) {
             when {
                 loading -> CircularProgressIndicator(Modifier.align(Alignment.Center))
-                error != null -> Column(Modifier.padding(16.dp)) {
-                    Text("出错了", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.titleMedium)
-                    Spacer(Modifier.height(8.dp))
-                    Text(error!!, color = MaterialTheme.colorScheme.error)
-                }
-                else -> LazyColumn(
-                    Modifier.fillMaxSize(),
-                    state = listState,
-                    contentPadding = PaddingValues(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
+                else -> Column(Modifier.fillMaxSize()) {
+                    // 错误以横幅呈现，聊天记录始终保留（整页替换会让历史不可见且无恢复入口）
+                    error?.let {
+                        Surface(color = MaterialTheme.colorScheme.errorContainer, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
+                            Text(it, Modifier.padding(8.dp), color = MaterialTheme.colorScheme.onErrorContainer,
+                                style = MaterialTheme.typography.bodySmall)
+                        }
+                        Spacer(Modifier.height(6.dp))
+                    }
+                    LazyColumn(
+                        Modifier.fillMaxWidth().weight(1f),
+                        state = listState,
+                        contentPadding = PaddingValues(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
                     items(bubbles) { b ->
                         when {
                             b.isReasoning -> ReasoningBubble(b.text, live = false)
@@ -445,6 +453,7 @@ fun ChatScreen(
                             }
                         }
                     }
+                }
                 }
             }
 
@@ -565,13 +574,15 @@ fun ChatScreen(
                     },
                     confirmButton = {
                         Button(onClick = {
-                            AppSession.agentOrNull()?.respondPermission(p.optString("_serverId"), "allow", "用户允许")
+                            runCatching { AppSession.agentOrNull()?.respondPermission(p.optString("_serverId"), "allow", "用户允许") }
+                                .onFailure { android.util.Log.e("ChatScreen", "应答权限失败", it) }
                             permissionQueue.remove(p)
                         }) { Text("允许") }
                     },
                     dismissButton = {
                         OutlinedButton(onClick = {
-                            AppSession.agentOrNull()?.respondPermission(p.optString("_serverId"), "deny", "用户拒绝")
+                            runCatching { AppSession.agentOrNull()?.respondPermission(p.optString("_serverId"), "deny", "用户拒绝") }
+                                .onFailure { android.util.Log.e("ChatScreen", "应答权限失败", it) }
                             permissionQueue.remove(p)
                         }) { Text("拒绝") }
                     },

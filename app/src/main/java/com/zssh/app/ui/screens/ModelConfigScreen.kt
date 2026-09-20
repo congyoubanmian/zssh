@@ -89,7 +89,11 @@ fun ModelConfigScreen(onDone: () -> Unit) {
             onDismiss = { showEditor = false },
             onSave = { p ->
                 val cur = providers.toMutableList()
-                val i = cur.indexOfFirst { it.name == p.name }
+                // 优先按 providerId 匹配（重命名也能替换旧条目），无 id 的新条目回退按名字
+                val i = cur.indexOfFirst { existing ->
+                    (p.providerId != null && existing.providerId == p.providerId) ||
+                        (p.providerId == null && existing.name == p.name)
+                }
                 if (i >= 0) cur[i] = p else cur.add(p)
                 providers = cur
                 ConnectionStore.saveProviders(ctx, providers)

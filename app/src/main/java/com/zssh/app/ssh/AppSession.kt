@@ -2,18 +2,22 @@ package com.zssh.app.ssh
 
 import com.zssh.app.data.ConnectionConfig
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import net.schmizz.sshj.SSHClient
 
 /**
  * 跨界面的全局远程会话状态：保持 SSH 连接与引擎实例，
  * 检测页 → 会话列表 → 聊天页共用同一条 SSH 通道。
+ * 全部状态变更经 stateMutex 串行化，防止并发下创建双连接/双引擎。
  */
 object AppSession {
     var config: ConnectionConfig? = null
     var detect: DetectResult? = null
     private var ssh: SSHClient? = null
     private var agent: AgentSession? = null
+    private val stateMutex = Mutex()
 
     /** M2 版本检查结果（桌面端同款：远端 zcode-server --version） */
     var serverVersion: String? = null
@@ -21,9 +25,22 @@ object AppSession {
 
     val homeDir: String get() = detect?.home?.ifBlank { "~" } ?: "~"
 
-    suspend fun ensureConnected(cfg: ConnectionConfig): SSHClient = withContext(Dispatchers.IO) {
-        config = cfg
-        ssh?.takeIf { it.isConnected } ?: SshService.connect(cfg).also { ssh = it }
+    suspend fun ensureConnected(cfg: ConnectionConfig): SSHClient = stateMutex.withLock {
+        withContext(Dispatchers.IO) {
+            val existing = ssh
+            // 已连接且是同一主机/端口/用户：复用；否则关旧建新（不泄漏）
+            if (existing != null && existing.isConnected &&
+                config?.let { it.host == cfg.host && it.port == cfg.port && it.username == cfg.username } == true
+            ) {
+                config = cfg
+                return@withContext existing
+            }
+            runCatching { existing?.disconnect() }
+            val client = SshService.connect(cfg)
+            ssh = client
+            config = cfg
+            client
+        }
     }
 
     /** 桌面端同款幂等检查：远端 zcode-server --version；null 表示未部署 */
@@ -45,17 +62,23 @@ object AppSession {
     }
 
     /** 启动引擎（复用存活实例；已断线的实例丢弃重建，避免拿死通道挂住调用方） */
-    suspend fun ensureAgent(workspacePath: String): AgentSession {
+    suspend fun ensureAgent(workspacePath: String): AgentSession = stateMutex.withLock {
         val client = ssh ?: throw IllegalStateException("SSH 未连接")
         agent?.let { existing ->
             if (!existing.isClosed) return existing
             runCatching { existing.close() }
             agent = null
         }
-        return AgentSession(client, homeDir, workspacePath).also {
-            it.start()
-            agent = it
+        val fresh = AgentSession(client, homeDir, workspacePath)
+        try {
+            fresh.start()
+        } catch (e: Exception) {
+            // 启动失败的实例不保留（其通道已在 start 内清理），避免半构造实例泄漏
+            runCatching { fresh.close() }
+            throw e
         }
+        agent = fresh
+        fresh
     }
 
     /** 断线重连：丢弃死引擎、启动新实例（会话由调用方 resume 恢复） */
@@ -145,8 +168,14 @@ object AppSession {
     }
 
     fun closeAll() {
-        runCatching { agent?.close() }
-        runCatching { ssh?.disconnect() }
-        agent = null; ssh = null; detect = null; config = null; serverVersion = null
+        // 不走 suspend 锁（调用点在主线程）：直接尝试加锁，拿不到说明有操作正在进行，跳过本次清理
+        if (!stateMutex.tryLock()) return
+        try {
+            runCatching { agent?.close() }
+            runCatching { ssh?.disconnect() }
+            agent = null; ssh = null; detect = null; config = null; serverVersion = null
+        } finally {
+            stateMutex.unlock()
+        }
     }
 }

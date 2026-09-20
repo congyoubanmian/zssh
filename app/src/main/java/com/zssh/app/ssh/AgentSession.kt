@@ -50,33 +50,42 @@ class AgentSession(
     private val enginePath by lazy { "$homeDir/.zcode/server/agents/glm/zcode.cjs" }
 
     suspend fun start() = kotlinx.coroutines.withContext(Dispatchers.IO) {
+        // 远端路径一律单引号包裹：目录含空格时命令不会被拆断，元字符也不构成注入
+        fun q(s: String) = "'" + s.replace("'", "'\\''") + "'"
         val command = buildString {
-            append("cd $workspacePath && ")
-            append("ZCODE_HOME=$homeDir ZCODE_DATA_BASE_DIR=$homeDir ")
-            append("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE=$homeDir/.zcode/v2/runtime/provider/bundled/zcode-builtin.json ")
-            append("$homeDir/.zcode/server/node $enginePath app-server --stdio")
+            append("cd ${q(workspacePath)} && ")
+            append("ZCODE_HOME=${q(homeDir)} ZCODE_DATA_BASE_DIR=${q(homeDir)} ")
+            append("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE=${q("$homeDir/.zcode/v2/runtime/provider/bundled/zcode-builtin.json")} ")
+            append("${q("$homeDir/.zcode/server/node")} ${q(enginePath)} app-server --stdio")
         }
         Log.i(TAG, "启动引擎: $command")
         val s = ssh.startSession()
         session = s
-        val cmd = s.exec(command)
-        val reader = Thread {
-            runBlocking {
-                try {
-                    val reader = BufferedReader(InputStreamReader(cmd.inputStream, Charsets.UTF_8))
-                    var line: String?
-                    while (reader.readLine().also { line = it } != null) handleLine(line!!)
-                    // EOF：引擎退出或 SSH 断开。必须通知 UI，否则界面永久卡在运行状态
-                    onEngineClosed(cmd.exitErrorMessage ?: "引擎退出 (exit=${cmd.exitStatus})")
-                } catch (e: Exception) {
-                    onEngineClosed("连接断开: ${e.message ?: e.javaClass.simpleName}")
+        try {
+            val cmd = s.exec(command)
+            val reader = Thread {
+                runBlocking {
+                    try {
+                        val reader = BufferedReader(InputStreamReader(cmd.inputStream, Charsets.UTF_8))
+                        var line: String?
+                        while (reader.readLine().also { line = it } != null) handleLine(line!!)
+                        // EOF：引擎退出或 SSH 断开。必须通知 UI，否则界面永久卡在运行状态
+                        onEngineClosed(cmd.exitErrorMessage ?: "引擎退出 (exit=${cmd.exitStatus})")
+                    } catch (e: Exception) {
+                        onEngineClosed("连接断开: ${e.message ?: e.javaClass.simpleName}")
+                    }
                 }
             }
+            reader.isDaemon = true
+            reader.start()
+            // 引擎启动握手：等第一条通知到达（startup/storageState）
+            waitForStartup()
+        } catch (e: Exception) {
+            // 启动失败必须清理半开的通道，否则 SSH 通道与读线程泄漏
+            runCatching { s.close() }
+            onEngineClosed("引擎启动失败: ${e.message}")
+            throw e
         }
-        reader.isDaemon = true
-        reader.start()
-        // 引擎启动握手：等第一条通知到达（startup/storageState）
-        waitForStartup()
         Unit
     }
 

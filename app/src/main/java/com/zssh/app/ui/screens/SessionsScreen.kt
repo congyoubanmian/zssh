@@ -4,6 +4,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
@@ -30,9 +31,10 @@ fun SessionsScreen(
     var showDirPicker by remember { mutableStateOf(false) }
     val fmt = remember { SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()) }
 
-    LaunchedEffect(Unit) {
+    var retryKey by remember { mutableStateOf(0) }
+    LaunchedEffect(retryKey) {
         try {
-            val cfg = AppSession.config ?: throw IllegalStateException("无连接配置")
+            val cfg = AppSession.config ?: throw IllegalStateException("无连接配置（请从连接列表重新进入）")
             AppSession.ensureConnected(cfg)
             val v = AppSession.versionCheck()
             status = if (v != null) "远端 zcode-server v$v ✓（已部署，跳过安装）" else "远端未部署 zcode-server（M2 部署模块待接入）"
@@ -68,6 +70,7 @@ fun SessionsScreen(
         topBar = {
             TopAppBar(
                 title = { Text("会话列表 · ${AppSession.config?.name ?: ""}") },
+                navigationIcon = { TextButton(onClick = onBack) { Text("返回") } },
                 actions = { TextButton(onClick = onModelConfig) { Text("模型配置") } },
             )
         },
@@ -77,11 +80,15 @@ fun SessionsScreen(
     ) { pad ->
         Column(Modifier.padding(pad).padding(16.dp).fillMaxSize()) {
             Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
-            error?.let { Spacer(Modifier.height(8.dp)); Text(it, color = MaterialTheme.colorScheme.error) }
+            error?.let {
+                Spacer(Modifier.height(8.dp))
+                Text(it, color = MaterialTheme.colorScheme.error)
+                TextButton(onClick = { error = null; retryKey++ }) { Text("重试") }
+            }
             Spacer(Modifier.height(8.dp))
             if (ready && sessions.isEmpty()) Text("远端还没有任何会话，点 + 开始新会话")
             LazyColumn(Modifier.fillMaxSize()) {
-                items(sessions, key = { it.optString("sessionId") }) { s ->
+                itemsIndexed(sessions, key = { i, s -> s.optString("sessionId").ifBlank { "idx-$i" } }) { _, s ->
                     val ts = s.optLong("updatedAt", 0)
                     Column(
                         Modifier.fillMaxWidth().clickable { onOpen(s.optString("sessionId")) }.padding(12.dp, 8.dp),
