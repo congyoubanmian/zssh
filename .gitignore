@@ -1,0 +1,26 @@
+# 构建产物与 Gradle 缓存（含 1.1G 的隔离 GRADLE_USER_HOME）
+.gradle/
+.gradle-home/
+.kotlin/
+build/
+app/build/
+*.apk
+*.aab
+
+# 本机配置（SDK 路径等）
+local.properties
+
+# 签名密钥
+*.jks
+*.keystore
+*.pem
+*.key
+keystore.properties
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# 日志
+*.log
