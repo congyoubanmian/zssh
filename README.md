@@ -35,14 +35,18 @@
 App 不强制登录：首次进入直接在 SSH 页添加服务器连接；连接后如需模型，
 可在「工具 → 模型配置」手动添加任意厂商 API Key，或在「我的」页一键登录 Z.ai / BigModel 套餐自动取 Key。
 
-## 技术要点（协议均为实测逆向 + 真机验证）
+## 技术要点
+
+协议实现以开源仓库 [zai-org/ZCode](https://github.com/zai-org/ZCode) 为准
+（权威 schema：`packages/shared/src/zcode-protocol/`，Apache-2.0），并在真机验证：
 
 - 引擎对话协议：`ZCode Protocol v1`（session/create·resume·send·subscribe·setModel·setMode…），
   事件流带单调 seq，订阅支持 afterSeq 断点
 - 引擎要求客户端应答反向请求：`session/requestRuntimePreferences`、`interaction/requestPermission`
-  （`{decision: allow|deny}`），15s 超时
+  （`{decision: allow|deny}`），15s 超时；不支持的反向请求回 -32601 降级
 - 供应商/API Key 配置在远端 `~/.zcode/v2/provider_config.json`（非 cli/config.json）
-- 远端引擎独立启动需 `ZCODE_HOME`、`ZCODE_DATA_BASE_DIR`、`ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`
+- 远端引擎独立启动需 `ZCODE_HOME`、`ZCODE_DATA_BASE_DIR`、
+  `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` + `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`（成对）
 - 安卓特有坑：系统精简版 BouncyCastle 缺 X25519/Ed25519（需注册完整版 BC）；
   sshj 单 session 通道只能执行一条命令（每命令新开 session）
 
