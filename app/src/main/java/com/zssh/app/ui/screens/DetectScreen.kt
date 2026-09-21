@@ -33,13 +33,16 @@ fun DetectScreen(config: com.zssh.app.data.ConnectionConfig, onSessions: () -> U
             try {
                 val r = SshService.detect(config) { s -> steps.add(s) }
                 result = r
+                // connectTo：建立（或复用）这条连接的槽位并切换为活动连接；旧连接保持后台存活
+                AppSession.connectTo(config)
                 AppSession.detect = r
-                AppSession.config = config
             } catch (e: IllegalStateException) {
                 error = e.message
                 steps.forEach { } // 保持已显示步骤
             } catch (e: Exception) {
-                error = e.message ?: "未知错误"
+                // message 可能为 null（如 NetworkOnMainThreadException），带上异常类名便于定位
+                android.util.Log.e("DetectScreen", "检测/连接流程失败 ${config.username}@${config.host}:${config.port}", e)
+                error = e.message ?: "未知错误（${e.javaClass.simpleName}）"
             } finally {
                 running = false
             }
@@ -57,7 +60,8 @@ fun DetectScreen(config: com.zssh.app.data.ConnectionConfig, onSessions: () -> U
             steps.forEach { s ->
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("•", color = MaterialTheme.colorScheme.primary)
-                    Text(s)
+                    // 步骤文本可能含 host:port（"建立 SSH 连接 x.x.x.x:22 …"），按当前连接的 config 脱敏
+                    Text(maskStepText(s, config))
                 }
             }
             if (running) LinearProgressIndicator(Modifier.fillMaxWidth())
@@ -95,4 +99,17 @@ private fun KeyValue(k: String, v: String) {
         Text(k, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Text(v, style = MaterialTheme.typography.bodyLarge)
     }
+}
+
+/** 步骤文本脱敏：把 config 的 host:port 替换成打星形式（"建立 SSH 连接 1.2.3.4:22 …" → "… 1**.***.***.***:22 …"） */
+private fun maskStepText(text: String, config: com.zssh.app.data.ConnectionConfig): String {
+    val host = config.host
+    val maskedHost = when {
+        host.count { it == '.' } == 3 && host.all { it.isDigit() || it == '.' } ->
+            host.substringBefore('.') + ".***.***.***"
+        host.length > 4 -> host.take(2) + "***" + host.takeLast(2)
+        else -> "***"
+    }
+    return text.replace("$host:${config.port}", "$maskedHost:***")
+        .replace(host, maskedHost)
 }

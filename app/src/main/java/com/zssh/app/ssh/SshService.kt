@@ -49,11 +49,31 @@ object SshService {
     fun connect(config: ConnectionConfig): SSHClient {
         val ssh = SSHClient()
         ssh.useCompression()
+        // 连接超时 15s：网络黑洞时快速失败，不再永远转圈
+        ssh.connectTimeout = 15_000
         // M1: 先信任所有主机指纹；M4 换成首次记录+比对（对应桌面的 host key 流程）
         ssh.addHostKeyVerifier(PromiscuousVerifier())
         ssh.connect(config.host, config.port)
+        // keepalive 30s：NAT 静默断连后尽快发现，而不是等下一次操作才报错
+        runCatching { ssh.connection.keepAlive.keepAliveInterval = 30 }
         when (config.authType) {
-            AuthType.PASSWORD -> ssh.authPassword(config.username, config.password ?: "")
+            AuthType.PASSWORD -> {
+                val pwd = (config.password ?: "")
+                // 对齐桌面端 ssh-backend：password 与 keyboard-interactive 双方式并试。
+                // 只用 authPassword 时，PAM/keyboard-interactive-only 的 sshd 会报
+                // "Exhausted available authentication methods"（即使密码正确）。
+                val finder = object : net.schmizz.sshj.userauth.password.PasswordFinder {
+                    override fun reqPassword(replyToPrompt: net.schmizz.sshj.userauth.password.Resource<*>?) = pwd.toCharArray()
+                    override fun shouldRetry(resource: net.schmizz.sshj.userauth.password.Resource<*>?) = false
+                }
+                ssh.auth(
+                    config.username,
+                    net.schmizz.sshj.userauth.method.AuthPassword(finder),
+                    net.schmizz.sshj.userauth.method.AuthKeyboardInteractive(
+                        net.schmizz.sshj.userauth.method.PasswordResponseProvider(finder),
+                    ),
+                )
+            }
             AuthType.PRIVATE_KEY -> {
                 val pem = config.privateKeyPem ?: throw IllegalArgumentException("未导入私钥")
                 val finder = config.passphrase?.let {
@@ -99,11 +119,13 @@ object SshService {
                 onStep("检测完成：${r.manifestArch}，HOME=${r.home}")
                 r
             } catch (e: UserAuthException) {
-                throw IllegalStateException("SSH 认证失败：请检查用户名、密码或私钥配置", e)
+                android.util.Log.e(TAG, "detect 认证失败 host=${config.host}:${config.port} user=${config.username}", e)
+                throw IllegalStateException("SSH 认证失败：请检查用户名、密码或私钥配置（${e.message?.take(80)}）", e)
             } catch (e: Exception) {
+                android.util.Log.e(TAG, "detect 连接失败 host=${config.host}:${config.port} user=${config.username}", e)
                 val msg = if (e.message?.contains("timed out", true) == true ||
                     e.message?.contains("timeout", true) == true
-                ) "SSH 连接握手超时" else (e.message ?: "未知错误")
+                ) "SSH 连接握手超时（15s）：主机不可达或网络不通" else (e.message ?: "未知错误")
                 throw IllegalStateException(msg, e)
             } finally {
                 runCatching { ssh?.disconnect() }
@@ -125,3 +147,5 @@ object SshService {
             }
         }
 }
+
+private const val TAG = "SshService"

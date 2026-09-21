@@ -1,5 +1,6 @@
 package com.zssh.app.ui.screens
 
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -7,15 +8,20 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.zssh.app.data.ConnectionStore
+import com.zssh.app.data.LoginService
 import com.zssh.app.data.ModelProvider
 import com.zssh.app.ssh.AppSession
+import com.zssh.app.ui.notifyLoginResult
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
-/** 模型配置页：供应商列表（从远端拉取同步 / 本地编辑 / 推送回远端） */
+/** 模型配置页：套餐账号登录 + 供应商列表（从远端拉取同步 / 本地编辑 / 推送回远端） */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ModelConfigScreen(onDone: () -> Unit) {
@@ -26,6 +32,86 @@ fun ModelConfigScreen(onDone: () -> Unit) {
     var editing by remember { mutableStateOf<ModelProvider?>(null) }
     var showEditor by remember { mutableStateOf(false) }
     var syncBusy by remember { mutableStateOf(false) }
+
+    // ---- 套餐账号登录（OAuth → 自动换取 Coding Plan API Key）----
+    var loginBusy by remember { mutableStateOf(false) }
+    var loginAuthUrl by remember { mutableStateOf<String?>(null) }
+    var loginStatus by remember { mutableStateOf<String?>(null) }
+    var loginJob by remember { mutableStateOf<Job?>(null) }
+
+    // 前后台标记：登录在浏览器授权期间完成时，只在后台才发通知拉回
+    var resumed by remember { mutableStateOf(true) }
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, e ->
+            resumed = e == androidx.lifecycle.Lifecycle.Event.ON_RESUME
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val notifPermLauncher = rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
+    ) { }
+
+    fun openInBrowser(url: String) {
+        runCatching {
+            ctx.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+        }
+    }
+
+    fun copyLink(url: String) {
+        val cm = ctx.getSystemService(android.content.ClipboardManager::class.java)
+        cm?.setPrimaryClip(android.content.ClipData.newPlainText("authorize_url", url))
+        status = "授权链接已复制"
+    }
+
+    fun startLogin(providerId: String) {
+        loginBusy = true; loginAuthUrl = null; loginStatus = null; status = null
+        // Android 13+ 通知需运行时授权；拒绝也不影响登录，只是少了"完成拉回"
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            runCatching { notifPermLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS) }
+        }
+        loginJob = scope.launch {
+            try {
+                val result = LoginService.login(
+                    providerId,
+                    onAuthorizeUrl = { url -> loginAuthUrl = url; openInBrowser(url) },
+                    onStatus = { msg ->
+                        // 官方 CLI 流程无回跳：授权后浏览器停在 callback 页属预期，完成靠本 App 轮询
+                        loginStatus = if (msg.contains("等待浏览器"))
+                            "授权完成后浏览器会停在 zcode.z.ai 的 callback 页，无需理会，直接返回本 App 即可"
+                        else msg
+                    },
+                )
+                // 轮询到 ready：尽力拉回前台（被系统限制时静默失败，由通知兜底）
+                runCatching {
+                    ctx.startActivity(
+                        android.content.Intent(ctx, com.zssh.app.MainActivity::class.java)
+                            .addFlags(android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                    )
+                }
+                val provider = LoginService.toProvider(result)
+                val cur = providers.toMutableList()
+                val i = cur.indexOfFirst { it.name == provider.name }
+                if (i >= 0) cur[i] = provider else cur.add(provider)
+                providers = cur
+                ConnectionStore.saveProviders(ctx, providers)
+                var msg = "已登录 ${LoginService.userLabel(result.user)}，套餐供应商已保存（密钥加密存储）"
+                runCatching {
+                    if (AppSession.pushProviderConfig(cur)) msg += "；已推送远端 provider_config.json"
+                }
+                status = msg
+                if (!resumed) notifyLoginResult(ctx, ok = true, detail = msg)
+            } catch (e: CancellationException) {
+                status = "已取消登录"
+            } catch (e: Exception) {
+                status = "登录失败：${e.message?.take(250)}"
+                if (!resumed) notifyLoginResult(ctx, ok = false, detail = status ?: "登录失败")
+            } finally {
+                loginBusy = false; loginAuthUrl = null; loginStatus = null
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -64,6 +150,52 @@ fun ModelConfigScreen(onDone: () -> Unit) {
             )
             Spacer(Modifier.height(8.dp))
             status?.let { Text(it, color = MaterialTheme.colorScheme.primary); Spacer(Modifier.height(8.dp)) }
+            // ---- 登录卡片 ----
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(Modifier.padding(12.dp)) {
+                    Text("套餐账号登录", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        "登录 Z.ai / BigModel 账号，自动获取 Coding Plan 专用 API Key 并生成供应商条目，无需手动填 Key。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    if (loginBusy) {
+                        loginAuthUrl?.let { url ->
+                            Text(
+                                "若浏览器没有自动打开，点下方按钮完成授权：",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                TextButton(onClick = { openInBrowser(url) }) { Text("打开授权页面") }
+                                TextButton(onClick = { copyLink(url) }) { Text("复制链接") }
+                                TextButton(onClick = { loginJob?.cancel() }) { Text("取消") }
+                            }
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            CircularProgressIndicator(
+                                Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                            )
+                            Text(
+                                loginStatus ?: "登录中…",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    } else {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(onClick = { startLogin("zai") }) { Text("登录 Z.ai") }
+                            OutlinedButton(onClick = { startLogin("bigmodel") }) { Text("登录 BigModel") }
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(12.dp))
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxSize()) {
                 items(providers, key = { it.name }) { p ->
                     Surface(shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth().clickable { editing = p; showEditor = true }) {
@@ -167,3 +299,4 @@ private fun ProviderEditorDialog(
         },
     )
 }
+
