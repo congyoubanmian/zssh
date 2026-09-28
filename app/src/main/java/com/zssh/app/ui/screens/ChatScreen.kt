@@ -25,6 +25,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.zssh.app.ssh.AgentSession
 import com.zssh.app.ssh.AppSession
@@ -238,7 +239,15 @@ fun ChatScreen(
                     drainQueue()
                 }
                 "turn.failed" -> {
-                    bubbles.add(Bubble("assistant", "❌ 本轮失败: " + payload.toString().take(200), kind = "tool"))
+                    // zcodeTurnFailedEventPayloadSchema（index.ts L1265-1271）：{error:{code,message,data?},
+                    // turnPhase, inputId?} —— 不带 tokenCount/duration（失败轮消耗协议不下发，无法出用量角标），
+                    // 提取 error.message+turnPhase 做人话提示；message 缺失回退 error.code，再缺失才裸 JSON 前 200
+                    val err = payload.optJSONObject("error")
+                    val phase = payload.optString("turnPhase").takeIf { it.isNotBlank() }?.let { "（阶段: $it）" } ?: ""
+                    val reason = err?.optString("message")?.takeIf { it.isNotBlank() }
+                        ?: err?.optString("code")?.takeIf { it.isNotBlank() }
+                        ?: payload.toString().take(200)
+                    bubbles.add(Bubble("assistant", "❌ 本轮失败$phase: $reason", kind = "tool"))
                     streaming = ""
                     reasoning = ""
                     reasoningLive = false
@@ -588,6 +597,8 @@ fun ChatScreen(
                                         else -> MaterialTheme.colorScheme.onSurfaceVariant
                                     },
                                     maxLines = 1,
+                                    // 长角标（cancelled+全字段）窄屏会超出宽度；Ellipsis 而非默认 Clip，至少保留可见前缀
+                                    overflow = TextOverflow.Ellipsis,
                                 )
                             }
                             b.role == "user" -> Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
