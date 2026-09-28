@@ -48,9 +48,17 @@ fun ChatScreen(
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
 
-    data class Bubble(val role: String, val text: String, val kind: String = "text") {
+    data class Bubble(
+        val role: String,
+        val text: String,
+        val kind: String = "text",
+        // resultType 仅 usage 角标用（turn.completed 的结果枚举，index.ts L1251-1259）；
+        // 带默认值，现有构造点零改动
+        val resultType: String = "",
+    ) {
         val isTool: Boolean get() = kind == "tool"
         val isReasoning: Boolean get() = kind == "reasoning"
+        val isUsage: Boolean get() = kind == "usage"
     }
     val bubbles = remember { mutableStateListOf<Bubble>() }
     var streaming by remember { mutableStateOf("") }        // 正在流式输出的答案
@@ -82,6 +90,9 @@ fun ChatScreen(
     // 快照缺字段或窗口为 0 时保持 null，顶栏隐藏进度条（不报错）
     var contextUsed by remember { mutableStateOf<Long?>(null) }
     var contextWindow by remember { mutableStateOf<Long?>(null) }
+    // 压缩请求进行中（session/compact → requestCompact）：防重复点击；
+    // 断线时随运行状态一并复位，否则按钮永久禁用
+    var compacting by remember { mutableStateOf(false) }
 
     // ---- 发送 / 排队 / 插队（组合级 action，事件收集器和输入栏共用）----
     fun doSend(text: String) {
@@ -122,6 +133,37 @@ fun ChatScreen(
             runCatching { agent.stopSession(current) }
             kotlinx.coroutines.delay(400)
             if (!running) drainQueue()
+        }
+    }
+
+    /** 压缩会话历史（session/compact → AgentSession.compactSession，方法名映射
+     *  zcodeProtocolMethods.sessionCompact，index.ts L3589）。按返回 compact.state 反馈：
+     *  accepted=已开始、already_running=已在进行中；compact 字段 optional（index.ts L1845-1852）
+     *  缺失不当失败，按已完成处理并仍从 snapshot.projection 刷新用量（防御式写法对齐
+     *  openSession：optLong(-1)+takeIf，缺字段保持原值，proj 为 null 时整段跳过不清用量条） */
+    fun requestCompact() {
+        if (compacting || running || connectionLost) return
+        val agent = AppSession.agentOrNull() ?: return
+        val current = sid ?: return
+        compacting = true
+        scope.launch {
+            try {
+                val res = agent.compactSession(current)
+                when (res.optJSONObject("compact")?.optString("state")) {
+                    "already_running" -> bubbles.add(Bubble("assistant", "⏳ 已有压缩任务在进行中，请稍候", kind = "tool"))
+                    "accepted" -> bubbles.add(Bubble("assistant", "🧹 已开始压缩上下文", kind = "tool"))
+                    else -> bubbles.add(Bubble("assistant", "🧹 " + res.optString("response").ifBlank { "会话压缩完成" }, kind = "tool"))
+                }
+                val proj = res.optJSONObject("snapshot")?.optJSONObject("projection")
+                if (proj != null) {
+                    proj.optLong("contextUsed", -1L).takeIf { it >= 0 }?.let { contextUsed = it }
+                    proj.optLong("contextWindow", -1L).takeIf { it > 0 }?.let { contextWindow = it }
+                }
+            } catch (e: Exception) {
+                bubbles.add(Bubble("assistant", "❌ 压缩失败: " + (e.message?.take(200) ?: "未知"), kind = "tool"))
+            } finally {
+                compacting = false
+            }
         }
     }
 
@@ -176,6 +218,20 @@ fun ChatScreen(
                         reasoning = ""
                     }
                     if (response.isNotBlank()) bubbles.add(Bubble("assistant", response))
+                    // 每轮用量角标（zcodeTurnCompletedEventPayloadSchema，index.ts L1231-1262）：
+                    // tokenCount/toolCallCount/duration 虽是 schema 必带仍 opt* 防御式读取，
+                    // 三项计数任一 >=0 才出角标；cancelled 也走本分支（L1253-1254 注释：用户
+                    // 中断复用 turn.completed，不映射 turn.failed），response 为空串时正文气泡
+                    // 不加但角标仍加；角标是 bubbles 列表成员，滚动索引自动计入
+                    val tokens = payload.optLong("tokenCount", -1L)
+                    val tools = payload.optInt("toolCallCount", -1)
+                    val durMs = payload.optLong("duration", -1L)
+                    if (tokens >= 0 || tools >= 0 || durMs >= 0) {
+                        val rt = payload.optString("resultType", "success")
+                        // cacheStats 只取 cacheReadTokens 一个可选字段（index.ts L1246），其余嵌套字段本期不深解析
+                        val cacheRead = payload.optJSONObject("cacheStats")?.optLong("cacheReadTokens", -1L) ?: -1L
+                        bubbles.add(Bubble("assistant", turnBadgeText(tokens, tools, durMs, rt, cacheRead), kind = "usage", resultType = rt))
+                    }
                     streaming = ""
                     reasoningLive = false
                     running = false
@@ -219,6 +275,7 @@ fun ChatScreen(
                     reasoning = ""
                     reasoningLive = false
                     running = false
+                    compacting = false   // 压缩请求标记一并复位，否则断线后按钮永久禁用
                     sendQueue.clear()
                     permissionQueue.clear()
                     userInputQueue.clear()
@@ -416,7 +473,8 @@ fun ChatScreen(
                     LinearProgressIndicator(
                         progress = { frac },
                         modifier = Modifier.weight(1f).height(4.dp),
-                        // 接近窗口上限（≥90%）转警示色，提示可 compact（ROADMAP#6）
+                        // 接近窗口上限（≥90%）转警示色，提示点「🧹 压缩」（requestCompact →
+                        // session/compact，schema 见 zcodeSessionCompactParamsSchema index.ts L1831-1838）
                         color = if (frac >= 0.9f) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                     )
                     val tokens = if (window >= 1000) "${used / 1000}k/${window / 1000}k" else "$used/$window"
@@ -425,6 +483,22 @@ fun ChatScreen(
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    // 🧹 压缩入口：压缩语义与用量条强绑定，挂本行（topBar actions 已有模式/模型/目录
+                    // 三按钮，再挂会溢出）。显示条件 sid != null（压缩必须有已创建会话）；用量条整行
+                    // 隐藏时入口随之不可见——无窗口数据时无从判断需要压缩，是接受的取舍，不另开常驻按钮
+                    if (sid != null) {
+                        TextButton(
+                            onClick = { requestCompact() },
+                            enabled = !compacting && !running && !connectionLost,
+                            contentPadding = PaddingValues(horizontal = 8.dp),
+                            colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.onSurfaceVariant),
+                        ) {
+                            Text(
+                                if (compacting) "压缩中…" else "🧹 压缩",
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                        }
+                    }
                 }
             }
             }
@@ -502,6 +576,19 @@ fun ChatScreen(
                                 Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(8.dp)) {
                                     Text(b.text, Modifier.padding(8.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
+                            }
+                            // 每轮用量角标：小字弱化层级对齐 tool 气泡；error_* 醒目红、cancelled 警示黄
+                            b.isUsage -> Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterStart) {
+                                Text(
+                                    b.text,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = when {
+                                        b.resultType.startsWith("error_") -> MaterialTheme.colorScheme.error
+                                        b.resultType == "cancelled" -> AppSemantic.warning()
+                                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
+                                    maxLines = 1,
+                                )
                             }
                             b.role == "user" -> Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
                                 Surface(color = MaterialTheme.colorScheme.primaryContainer, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth(0.88f)) {
@@ -684,6 +771,43 @@ fun ChatScreen(
             }
         }
     }
+}
+
+// ---- 每轮用量角标（turn.completed）----
+// 纯字符串拼接（不触碰 Composable 作用域，供 handleEvent 调用）；
+// 数字格式化固定 Locale.US，避免区域设置把小数点写成逗号
+
+/** token 数格式化：>=1000 缩写为 "%.1fk"（如 12345 → 12.3k） */
+private fun formatBadgeTokens(n: Long): String =
+    if (n >= 1000) String.format(java.util.Locale.US, "%.1fk", n / 1000.0) else n.toString()
+
+/** duration 格式化（协议 L1238 仅约束非负数，按毫秒格式化——与 createdAt 毫秒习惯一致的假设）：
+ *  >=60s → "X分Y秒"、>=1s → "X.Xs"、否则 "Nms" */
+private fun formatBadgeDuration(ms: Long): String = when {
+    ms >= 60_000 -> "${ms / 60_000}分${(ms % 60_000) / 1000}秒"
+    ms >= 1_000 -> String.format(java.util.Locale.US, "%.1fs", ms / 1000.0)
+    else -> "${ms}ms"
+}
+
+/** 组装每轮用量角标文案。resultType 枚举见 zcodeTurnCompletedEventPayloadSchema
+ *  （index.ts L1251-1259）：success/cancelled/error_max_turns/error_max_budget/
+ *  error_during_execution/error_max_tool_calls，未知值兜底显示原文不 crash */
+private fun turnBadgeText(tokens: Long, tools: Int, durMs: Long, resultType: String, cacheReadTokens: Long): String {
+    val prefix = when (resultType) {
+        "success" -> "✓"
+        "cancelled" -> "⏹ 已手动停止"
+        "error_max_turns" -> "⚠ 达到轮次上限"
+        "error_max_budget" -> "⚠ 预算耗尽"
+        "error_during_execution" -> "⚠ 执行出错"
+        "error_max_tool_calls" -> "⚠ 工具调用达上限"
+        else -> resultType.ifBlank { "✓" }
+    }
+    val parts = mutableListOf<String>()
+    if (tokens >= 0) parts.add("${formatBadgeTokens(tokens)} tokens")
+    if (tools >= 0) parts.add("工具 $tools 次")
+    if (durMs >= 0) parts.add(formatBadgeDuration(durMs))
+    if (cacheReadTokens >= 0) parts.add("缓存读 ${formatBadgeTokens(cacheReadTokens)}")
+    return prefix + " " + parts.joinToString(" · ")
 }
 
 // ---- 权限弹窗（B10：内嵌真实工具预览）----

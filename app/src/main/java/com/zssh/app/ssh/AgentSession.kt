@@ -296,6 +296,69 @@ class AgentSession(
         request("session/setMode", JSONObject().put("sessionId", sessionId).put("mode", mode))
     }
 
+    /** 压缩会话历史（session/compact，方法名映射 zcodeProtocolMethods.sessionCompact，index.ts L3589）。
+     *  params 只放 sessionId + 可选 instructions：zcodeSessionCompactParamsSchema（index.ts L1831-1838，
+     *  strict）仅收 {sessionId, inputId?, instructions?, expectedRevision?}，多传一个字段即 -32602；
+     *  instructions 为空白时不传（schema 是 z.string().optional()，空串无意义）。
+     *  result 见 zcodeSessionCompactResultSchema（index.ts L1841-1854）：{response, snapshot,
+     *  compact?{state:"accepted"|"already_running", inputId?, operationId?}} —— compact 为
+     *  optional，缺失不当失败；result 原样返回，state 判别留给 UI 层。
+     *  超时对齐 sendMessage 的 300s：压缩含一次模型总结调用，默认 60s 大概率不够 */
+    suspend fun compactSession(sessionId: String, instructions: String? = null): JSONObject =
+        request(
+            "session/compact",
+            JSONObject().put("sessionId", sessionId).apply {
+                if (!instructions.isNullOrBlank()) put("instructions", instructions)
+            },
+            300_000
+        )
+
+    /** 创建闲时任务（offPeak/create，方法名映射 zcodeProtocolMethods.offPeakCreate，index.ts L3650）。
+     *  params 严格按 zcodeOffPeakCreateParamsSchema（index.ts L3506-3516，strict）：
+     *  {title, prompt, permissionMode?, model?, thoughtLevel?, boundSessionId?}，
+     *  permissionMode 值域 build/edit/plan/yolo（L3503）；可选字段为空/空白一律不传
+     *  （均为 nonEmptyString.optional()，空串会被 strict 校验拒绝）。
+     *  返回原始 result 的 ok 判别联合（zcodeOffPeakCreateResultSchema，index.ts L3535-3553）：
+     *  ok=true → {task:{offPeakTaskId,title,status,queuePosition?,sessionId?,createdAt}}；
+     *  ok=false → {failureStage,errorCategory,errorCode} —— 本层不拆包，由 UI 层解 */
+    suspend fun offPeakCreate(
+        title: String,
+        prompt: String,
+        permissionMode: String? = null,
+        model: String? = null,
+        thoughtLevel: String? = null,
+        boundSessionId: String? = null,
+    ): JSONObject =
+        request(
+            "offPeak/create",
+            JSONObject().put("title", title).put("prompt", prompt).apply {
+                if (!permissionMode.isNullOrBlank()) put("permissionMode", permissionMode)
+                if (!model.isNullOrBlank()) put("model", model)
+                if (!thoughtLevel.isNullOrBlank()) put("thoughtLevel", thoughtLevel)
+                if (!boundSessionId.isNullOrBlank()) put("boundSessionId", boundSessionId)
+            }
+        )
+
+    /** createOffPeakTask：offPeakCreate 的同 RPC 别名（供按此命名调用的 UI 代码使用）；
+     *  model/thoughtLevel 本期 UI 无选择面、不透传，仅补 boundSessionId（会话内创建绑定时用） */
+    suspend fun createOffPeakTask(
+        title: String,
+        prompt: String,
+        permissionMode: String? = null,
+        boundSessionId: String? = null,
+    ): JSONObject = offPeakCreate(title, prompt, permissionMode, null, null, boundSessionId)
+
+    /** 列出闲时任务（offPeak/list，方法名映射 zcodeProtocolMethods.offPeakList，index.ts L3651）。
+     *  params 恒为空对象（zcodeOffPeakListParamsSchema，index.ts L3556，strict 空对象，
+     *  写法对齐 listSessions 的空参）；result {tasks:[快照]}（L3558-3560），tasks 缺失返回空数组 */
+    suspend fun offPeakList(): JSONArray {
+        val r = request("offPeak/list", JSONObject())
+        return r.optJSONArray("tasks") ?: JSONArray()
+    }
+
+    /** listOffPeakTasks：offPeakList 的同 RPC 别名（供按此命名调用的 UI 代码使用） */
+    suspend fun listOffPeakTasks(): JSONArray = offPeakList()
+
     fun close() {
         runCatching { session?.close() }
     }
